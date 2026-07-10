@@ -1,0 +1,27 @@
+{
+  "app_name": "Digital Twin",
+  "source_documents_dir": "./source_documents",
+  "vector_db_dir": "./vector_store",
+  "embedding_model": "nomic-embed-text",
+  "default_llm_model": "qwen2.5:7b",
+  "available_llm_models": [
+    "qwen2.5:7b",
+    "llama3:8b-instruct-q8_0",
+    "llama3:8b",
+    "mistral:7b-instruct-v0.3-q8_0",
+    "qwen2:7b",
+    "command-r"
+  ],
+  "suggested_prompts": [
+    "What projects are discussed in the indexed documents?",
+    "Summarize the main themes found in the document store.",
+    "Who is the lead engineer for Project Aurora and what is the budget?",
+    "What is the company remote work policy and its reference code?",
+    "Who is the designated first aid officer and what should we do in case of fire?",
+    "Retrieve the email address of Bob Jones."
+  ],
+  "chunk_size": 1000,
+  "chunk_overlap": 200,
+  "temperature": 0.0,
+  "top_k": 4
+}

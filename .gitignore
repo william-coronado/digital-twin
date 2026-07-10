@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Vector store output / runtime index data (rebuilt from source_documents/ on first run)
+vector_store/
+metadata_manifest.json
+
+# Personal / machine-specific configs — config.default.json is the tracked template
+config.json
+config.theology.json
+
+# Claude Code local-only files (skills dirs contain symlinks into .venv/, machine-specific)
+.claude/settings.local.json
+.claude/skills/
+.agents/skills/
+.mcp.json
+
+# Streamlit local secrets (not currently used, future-proofing)
+.streamlit/secrets.toml
+
+# Editor/OS cruft
+*.swp
+.idea/
+.vscode/
