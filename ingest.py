@@ -188,11 +188,14 @@ def load_manifest() -> Dict[str, Any]:
     if os.path.exists(MANIFEST_PATH):
         try:
             with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                manifest = json.load(f)
+            if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
+                raise ValueError("unexpected structure")
+            return manifest
         except Exception as e:
-            # Safe to continue: sync treats every file as new and replaces its
-            # chunks by source, so this costs a re-embed, not duplicates.
-            print(f"Warning: could not read manifest {MANIFEST_PATH} ({e}); all files will be re-indexed.")
+            # Safe to continue: with no index_settings, sync rebuilds the whole
+            # collection, which also drops chunks of files deleted meanwhile.
+            print(f"Warning: could not read manifest {MANIFEST_PATH} ({e}); the index will be rebuilt.")
     return {"files": {}, "total_chunks": 0}
 
 
@@ -229,11 +232,22 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
             "chunk_size": config["chunk_size"],
             "chunk_overlap": config["chunk_overlap"],
         }
-        # Older manifests lack some or all of these keys: assume they matched,
-        # except the document prefix, which didn't exist before (so was "").
-        previous_settings = {**index_settings, "document_prefix": "", **manifest.get("index_settings", {})}
+        # No recorded settings (manifest missing, unreadable or from before this
+        # check) means the collection's contents are unknown: rebuild. A lost
+        # manifest already means re-embedding every file, and a reset also drops
+        # chunks of files deleted while the manifest was missing.
+        previous_settings = manifest.get("index_settings")
         if previous_settings != index_settings:
-            if manifest["files"]:
+            with _db_lock:
+                has_chunks = db._collection.count() > 0
+            if has_chunks:
+                # Don't wipe a working index if it can't be rebuilt right now
+                try:
+                    db.embeddings.embed_query("ping")
+                except Exception as e:
+                    msg = f"Embedding model unavailable, so the existing index was left as is: {type(e).__name__}: {e}"
+                    print(f"Error: index rebuild needed ({previous_settings} -> {index_settings}). {msg}")
+                    return {**manifest, "failed": {"(index rebuild)": msg}}
                 print(f"Index settings changed ({previous_settings} -> {index_settings}); rebuilding the vector store...")
             with _db_lock:
                 db.reset_collection()
@@ -262,6 +276,7 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
                             print(f"Error accessing stats for {full_path}: {e}")
 
         # 3. Detect and handle deletions
+        failed = {}
         deleted_files = [fname for fname in manifest["files"] if fname not in current_files]
         for fname in deleted_files:
             if verbose:
@@ -271,9 +286,10 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
                 with _db_lock:
                     db.delete(where={"source": fname})
             except Exception as e:
-                # If the database or collection is empty, delete can fail; we catch and proceed
-                if verbose:
-                    print(f"Note: Could not delete {fname} from DB (might not exist yet): {e}")
+                # Keep the manifest entry so the next sync retries the delete
+                print(f"Error removing deleted file '{fname}' from DB: {type(e).__name__}: {e}")
+                failed[fname] = f"could not remove chunks: {type(e).__name__}: {e}"
+                continue
             del manifest["files"][fname]
 
         # 4. Detect and handle additions / modifications
@@ -282,7 +298,6 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
             chunk_overlap=config["chunk_overlap"]
         )
 
-        failed = {}
         for fname, info in current_files.items():
             is_new = fname not in manifest["files"]
             is_modified = False
@@ -303,8 +318,11 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
                     with _db_lock:
                         db.delete(where={"source": fname})
                 except Exception as e:
-                    if verbose:
-                        print(f"Note: Could not delete old chunks for {fname} from DB: {e}")
+                    # Re-adding now could leave stale chunks behind (e.g. past the end
+                    # of a shortened file); keep the old manifest entry and retry next sync
+                    print(f"Error removing old chunks of '{fname}': {type(e).__name__}: {e}")
+                    failed[fname] = f"could not remove old chunks: {type(e).__name__}: {e}"
+                    continue
 
                 try:
                     # Parse and chunk with relative path source
