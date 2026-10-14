@@ -1,0 +1,9 @@
+# Keep the dashboard private to this Mac and fully offline.
+[server]
+# Streamlit listens on all network interfaces by default, which would let
+# anyone on the same network query the indexed documents.
+address = "127.0.0.1"
+
+[browser]
+# Streamlit sends usage statistics to its servers by default.
+gatherUsageStats = false

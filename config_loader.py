@@ -12,6 +12,8 @@ _HARDCODED_FALLBACK = {
     "source_documents_dir": "./source_documents",
     "vector_db_dir": "./vector_store",
     "embedding_model": "nomic-embed-text",
+    "embed_batch_size": 32,
+    "filename_scoping": True,
     "default_llm_model": "qwen2.5:7b",
     "available_llm_models": [
         "qwen2.5:7b",
@@ -28,7 +30,9 @@ _HARDCODED_FALLBACK = {
     "chunk_size": 1000,
     "chunk_overlap": 200,
     "temperature": 0.0,
-    "top_k": 4
+    "top_k": 4,
+    "num_ctx": 8192,
+    "min_similarity": 0.0
 }
 
 

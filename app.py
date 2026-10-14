@@ -3,7 +3,6 @@ import logging
 logging.getLogger("streamlit.watcher.local_sources_watcher").setLevel(logging.ERROR)
 
 import os
-import time
 import random
 import html
 import streamlit as st
@@ -231,9 +230,17 @@ with st.sidebar:
     if st.button("🔄 Sync Documents Now", use_container_width=True):
         with st.spinner("Syncing files in `./source_documents`..."):
             manifest = sync_vector_store()
-            st.success("Synchronized successfully!")
-            time.sleep(0.5)
-            st.rerun()
+        failed = manifest.get("failed", {})
+        # Shown after the rerun below, which refreshes the counts above
+        if failed:
+            details = "\n".join(f"- **{f}**: {err}" for f, err in failed.items())
+            st.session_state.sync_notice = ("warning", f"Synced, but {len(failed)} item(s) failed (retried on the next sync):\n{details}")
+        else:
+            st.session_state.sync_notice = ("success", "Synchronized successfully!")
+        st.rerun()
+    if "sync_notice" in st.session_state:
+        kind, text = st.session_state.pop("sync_notice")
+        getattr(st, kind)(text)
 
     # 3. Model Configuration
     st.markdown("#### 🤖 Model Configuration")

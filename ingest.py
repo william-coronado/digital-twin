@@ -1,11 +1,13 @@
 import os
 import json
-import time
 import threading
 from typing import List, Dict, Any
 import pypdf
 import docx
-from langchain_core.documents import Document
+try:
+    from langchain_core.documents import Document
+except ImportError:
+    from langchain.schema import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
@@ -24,13 +26,44 @@ os.makedirs(SOURCE_DIR, exist_ok=True)
 os.makedirs(VECTOR_DB_DIR, exist_ok=True)
 
 
-def get_embedding_model() -> OllamaEmbeddings:
+# Task prefixes some embedding models were trained with; retrieval quality drops
+# without them. Keyed by model name without tag: (query prefix, document prefix).
+# Override per model with "embedding_query_prefix"/"embedding_document_prefix".
+KNOWN_EMBEDDING_PREFIXES = {
+    "nomic-embed-text": ("search_query: ", "search_document: "),
+    "mxbai-embed-large": ("Represent this sentence for searching relevant passages: ", ""),
+}
+
+
+class PrefixedOllamaEmbeddings(OllamaEmbeddings):
+    """OllamaEmbeddings that prepends the model's task prefix. Only the embedded
+    text is prefixed; Chroma stores the original chunk text."""
+    query_prefix: str = ""
+    document_prefix: str = ""
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return super().embed_documents([self.document_prefix + t for t in texts])
+
+    def embed_query(self, text: str) -> List[float]:
+        # The base embed_query routes through embed_documents, which would add
+        # the document prefix as well, so call the parent's directly.
+        return super().embed_documents([self.query_prefix + text])[0]
+
+
+def get_embedding_model() -> PrefixedOllamaEmbeddings:
     """Returns local embedding model wrapper."""
     config = load_config()
-    return OllamaEmbeddings(model=config["embedding_model"])
+    model = config["embedding_model"]
+    query_prefix, document_prefix = KNOWN_EMBEDDING_PREFIXES.get(model.split(":")[0], ("", ""))
+    return PrefixedOllamaEmbeddings(
+        model=model,
+        query_prefix=config.get("embedding_query_prefix", query_prefix),
+        document_prefix=config.get("embedding_document_prefix", document_prefix),
+    )
 
 
 _db_instance = None
+_db_embedding_settings = None  # what the shared client embeds with (fixed until restart)
 _db_lock = threading.RLock()  # guards instantiation and all read/write calls
 
 
@@ -39,108 +72,112 @@ def get_db() -> Chroma:
     (rather than one per ingest call and a separate one in QueryEngine)
     avoids two client objects concurrently hitting the same on-disk
     SQLite files from different threads (the folder watcher vs. queries)."""
-    global _db_instance
+    global _db_instance, _db_embedding_settings
     with _db_lock:
         if _db_instance is None:
+            embeddings = get_embedding_model()
             _db_instance = Chroma(
                 collection_name=COLLECTION_NAME,
-                embedding_function=get_embedding_model(),
+                embedding_function=embeddings,
                 persist_directory=VECTOR_DB_DIR,
             )
+            _db_embedding_settings = {
+                "embedding_model": embeddings.model,
+                "document_prefix": embeddings.document_prefix,
+            }
         return _db_instance
 
 
 def parse_file(file_path: str, rel_path: str) -> List[Document]:
-    """Parses a local file (TXT, MD, PDF, DOCX, CSV, Excel, HTML) and returns a list of LangChain Documents."""
+    """Parses a local file (TXT, MD, PDF, DOCX, CSV, Excel, HTML) and returns a list of LangChain Documents.
+
+    Raises on unreadable/corrupt files so callers can tell a parse failure apart from a file with no extractable text.
+    """
     filename = os.path.basename(file_path)
     ext = os.path.splitext(filename)[1].lower()
     documents = []
 
-    try:
-        if ext in (".txt", ".md"):
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                text = f.read()
-            if text.strip():
-                documents.append(Document(page_content=text, metadata={"source": rel_path}))
+    if ext in (".txt", ".md"):
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+        if text.strip():
+            documents.append(Document(page_content=text, metadata={"source": rel_path}))
 
-        elif ext == ".pdf":
-            reader = pypdf.PdfReader(file_path)
-            for i, page in enumerate(reader.pages):
-                text = page.extract_text()
-                if text and text.strip():
-                    documents.append(
-                        Document(
-                            page_content=text,
-                            metadata={"source": rel_path, "page": i + 1}
-                        )
+    elif ext == ".pdf":
+        reader = pypdf.PdfReader(file_path)
+        for i, page in enumerate(reader.pages):
+            text = page.extract_text()
+            if text and text.strip():
+                documents.append(
+                    Document(
+                        page_content=text,
+                        metadata={"source": rel_path, "page": i + 1}
                     )
+                )
 
-        elif ext == ".docx":
-            doc = docx.Document(file_path)
-            # Combine paragraphs
-            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+    elif ext == ".docx":
+        doc = docx.Document(file_path)
+        # Combine paragraphs
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+        
+        # Combine tables
+        tables_text = []
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if cells:
+                    tables_text.append(" | ".join(cells))
+        
+        content = "\n".join(paragraphs)
+        if tables_text:
+            content += "\n\n=== Tables ===\n" + "\n".join(tables_text)
             
-            # Combine tables
-            tables_text = []
-            for table in doc.tables:
-                for row in table.rows:
-                    cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-                    if cells:
-                        tables_text.append(" | ".join(cells))
-            
-            content = "\n".join(paragraphs)
-            if tables_text:
-                content += "\n\n=== Tables ===\n" + "\n".join(tables_text)
-                
-            if content.strip():
-                documents.append(Document(page_content=content, metadata={"source": rel_path}))
+        if content.strip():
+            documents.append(Document(page_content=content, metadata={"source": rel_path}))
 
-        elif ext == ".csv":
-            import csv
+    elif ext == ".csv":
+        import csv
+        rows_text = []
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            reader = csv.DictReader(f)
+            for i, row in enumerate(reader):
+                row_parts = [f"{k}: {v}" for k, v in row.items() if v]
+                if row_parts:
+                    rows_text.append(f"Row {i+1}: " + ", ".join(row_parts))
+        content = "\n".join(rows_text)
+        if content.strip():
+            documents.append(Document(page_content=content, metadata={"source": rel_path}))
+
+    elif ext == ".xlsx":
+        import pandas as pd
+        excel_data = pd.read_excel(file_path, sheet_name=None)
+        sheets_text = []
+        for sheet_name, df in excel_data.items():
+            df = df.fillna("")
             rows_text = []
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                reader = csv.DictReader(f)
-                for i, row in enumerate(reader):
-                    row_parts = [f"{k}: {v}" for k, v in row.items() if v]
-                    if row_parts:
-                        rows_text.append(f"Row {i+1}: " + ", ".join(row_parts))
-            content = "\n".join(rows_text)
-            if content.strip():
-                documents.append(Document(page_content=content, metadata={"source": rel_path}))
+            for i, row in df.iterrows():
+                row_parts = [f"{col}: {val}" for col, val in row.items() if str(val).strip()]
+                if row_parts:
+                    rows_text.append(f"Row {i+1}: " + ", ".join(row_parts))
+            if rows_text:
+                sheets_text.append(f"=== Sheet: {sheet_name} ===\n" + "\n".join(rows_text))
+        content = "\n\n".join(sheets_text)
+        if content.strip():
+            documents.append(Document(page_content=content, metadata={"source": rel_path}))
 
-        elif ext == ".xlsx":
-            import pandas as pd
-            excel_data = pd.read_excel(file_path, sheet_name=None)
-            sheets_text = []
-            for sheet_name, df in excel_data.items():
-                df = df.fillna("")
-                rows_text = []
-                for i, row in df.iterrows():
-                    row_parts = [f"{col}: {val}" for col, val in row.items() if str(val).strip()]
-                    if row_parts:
-                        rows_text.append(f"Row {i+1}: " + ", ".join(row_parts))
-                if rows_text:
-                    sheets_text.append(f"=== Sheet: {sheet_name} ===\n" + "\n".join(rows_text))
-            content = "\n\n".join(sheets_text)
-            if content.strip():
-                documents.append(Document(page_content=content, metadata={"source": rel_path}))
-
-        elif ext == ".html":
-            from bs4 import BeautifulSoup
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                soup = BeautifulSoup(f.read(), "html.parser")
-            # Remove scripts and styles
-            for elem in soup(["script", "style"]):
-                elem.decompose()
-            text = soup.get_text(separator="\n")
-            lines = (line.strip() for line in text.splitlines())
-            chunks_text = (phrase.strip() for line in lines for phrase in line.split("  "))
-            clean_text = "\n".join(chunk for chunk in chunks_text if chunk)
-            if clean_text.strip():
-                documents.append(Document(page_content=clean_text, metadata={"source": rel_path}))
-
-    except Exception as e:
-        print(f"Error parsing file {file_path}: {e}")
+    elif ext == ".html":
+        from bs4 import BeautifulSoup
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            soup = BeautifulSoup(f.read(), "html.parser")
+        # Remove scripts and styles
+        for elem in soup(["script", "style"]):
+            elem.decompose()
+        text = soup.get_text(separator="\n")
+        lines = (line.strip() for line in text.splitlines())
+        chunks_text = (phrase.strip() for line in lines for phrase in line.split("  "))
+        clean_text = "\n".join(chunk for chunk in chunks_text if chunk)
+        if clean_text.strip():
+            documents.append(Document(page_content=clean_text, metadata={"source": rel_path}))
 
     return documents
 
@@ -150,16 +187,24 @@ def load_manifest() -> Dict[str, Any]:
     if os.path.exists(MANIFEST_PATH):
         try:
             with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+                manifest = json.load(f)
+            if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
+                raise ValueError("unexpected structure")
+            return manifest
+        except Exception as e:
+            # Safe to continue: with no index_settings, sync rebuilds the whole
+            # collection, which also drops chunks of files deleted meanwhile.
+            print(f"Warning: could not read manifest {MANIFEST_PATH} ({e}); the index will be rebuilt.")
     return {"files": {}, "total_chunks": 0}
 
 
 def save_manifest(manifest: Dict[str, Any]):
-    """Saves indexing manifest metadata."""
-    with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
+    """Saves indexing manifest metadata atomically, so a crash mid-write (or a
+    query reading it concurrently) never sees a truncated file."""
+    tmp_path = MANIFEST_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
+    os.replace(tmp_path, MANIFEST_PATH)
 
 
 def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
@@ -167,14 +212,43 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
     Scans the source directory and performs incremental updates to the Chroma DB.
     Detects deleted, new, and modified files.
     """
-    manifest = load_manifest()
-
     # Hold the lock for the whole sync so a concurrent query (running the
     # shared Chroma client on another thread) can't interleave with an
     # in-progress write. Sync runs quickly, so this is fine for a
-    # single-user local tool.
+    # single-user local tool. The manifest is read inside the lock too, so two
+    # overlapping syncs (watcher + Sync button) can't overwrite each other.
     with _db_lock:
+        manifest = load_manifest()
         db = get_db()
+        config = load_config()
+
+        # 1. Rebuild from scratch if the embedding model, document prefix or
+        # chunking changed: old vectors would be incompatible (or chunked
+        # differently) from new ones. Embedding changes take effect after a
+        # restart (see get_db()).
+        index_settings = {
+            **_db_embedding_settings,
+            "chunk_size": config["chunk_size"],
+            "chunk_overlap": config["chunk_overlap"],
+        }
+        # No recorded settings (manifest missing, unreadable or from before this
+        # check) means the collection's contents are unknown: rebuild. A lost
+        # manifest already means re-embedding every file, and a reset also drops
+        # chunks of files deleted while the manifest was missing.
+        previous_settings = manifest.get("index_settings")
+        if previous_settings != index_settings:
+            if db._collection.count():
+                # Don't wipe a working index if it can't be rebuilt right now
+                try:
+                    db.embeddings.embed_query("ping")
+                except Exception as e:
+                    msg = f"Embedding model unavailable, so the existing index was left as is: {type(e).__name__}: {e}"
+                    print(f"Error: index rebuild needed ({previous_settings} -> {index_settings}). {msg}")
+                    return {**manifest, "failed": {"(index rebuild)": msg}}
+                print(f"Index settings changed ({previous_settings} -> {index_settings}); rebuilding the vector store...")
+            db.reset_collection()
+            manifest["files"] = {}
+        manifest["index_settings"] = index_settings
 
         # 2. Get list of files in source directory recursively
         allowed_exts = {".txt", ".md", ".pdf", ".docx", ".xlsx", ".csv", ".html"}
@@ -198,6 +272,7 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
                             print(f"Error accessing stats for {full_path}: {e}")
 
         # 3. Detect and handle deletions
+        failed = {}
         deleted_files = [fname for fname in manifest["files"] if fname not in current_files]
         for fname in deleted_files:
             if verbose:
@@ -206,13 +281,13 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
                 # Chroma deletes items using metadata filter
                 db.delete(where={"source": fname})
             except Exception as e:
-                # If the database or collection is empty, delete can fail; we catch and proceed
-                if verbose:
-                    print(f"Note: Could not delete {fname} from DB (might not exist yet): {e}")
+                # Keep the manifest entry so the next sync retries the delete
+                print(f"Error removing deleted file '{fname}' from DB: {type(e).__name__}: {e}")
+                failed[fname] = f"could not remove chunks: {type(e).__name__}: {e}"
+                continue
             del manifest["files"][fname]
 
         # 4. Detect and handle additions / modifications
-        config = load_config()
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=config["chunk_size"],
             chunk_overlap=config["chunk_overlap"]
@@ -223,49 +298,61 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
             is_modified = False
             if not is_new:
                 old_info = manifest["files"][fname]
-                is_modified = info["mtime"] > old_info.get("mtime", 0) or info["size"] != old_info.get("size", 0)
+                # != rather than >: a file replaced by an older copy (backup restore,
+                # cp -p, a sync client) still counts as changed
+                is_modified = info["mtime"] != old_info.get("mtime", 0) or info["size"] != old_info.get("size", 0)
 
             if is_new or is_modified:
                 if verbose:
                     action = "indexing new file" if is_new else "re-indexing modified file"
                     print(f"Detected change: {action} '{fname}'...")
 
-                if is_modified:
-                    # Remove old chunks before re-indexing
-                    try:
-                        db.delete(where={"source": fname})
-                    except Exception as e:
-                        if verbose:
-                            print(f"Note: Could not delete old chunks for {fname} from DB: {e}")
-
-                # Parse and chunk with relative path source
-                raw_docs = parse_file(info["path"], fname)
-                if not raw_docs:
-                    manifest["files"][fname] = {
-                        "mtime": info["mtime"],
-                        "size": info["size"],
-                        "chunks_count": 0
-                    }
+                # Remove any existing chunks first, even for "new" files: the
+                # manifest may have been lost while the vector store survived.
+                try:
+                    db.delete(where={"source": fname})
+                except Exception as e:
+                    # Re-adding now could leave stale chunks behind (e.g. past the end
+                    # of a shortened file); keep the old manifest entry and retry next sync
+                    print(f"Error removing old chunks of '{fname}': {type(e).__name__}: {e}")
+                    failed[fname] = f"could not remove old chunks: {type(e).__name__}: {e}"
                     continue
 
-                chunks = text_splitter.split_documents(raw_docs)
+                try:
+                    # Parse and chunk with relative path source
+                    raw_docs = parse_file(info["path"], fname)
+                    if not raw_docs:
+                        print(f"Warning: no extractable text in '{fname}' (scanned/image-only?); indexed with 0 chunks.")
+                    chunks = text_splitter.split_documents(raw_docs) if raw_docs else []
+                    # Stable IDs make re-adding a file overwrite (upsert) its chunks
+                    # instead of duplicating them
+                    ids = [f"{fname}#{n}" for n in range(len(chunks))]
 
-                if chunks:
-                    db.add_documents(chunks)
-                    manifest["files"][fname] = {
-                        "mtime": info["mtime"],
-                        "size": info["size"],
-                        "chunks_count": len(chunks)
-                    }
-                else:
-                    manifest["files"][fname] = {
-                        "mtime": info["mtime"],
-                        "size": info["size"],
-                        "chunks_count": 0
-                    }
+                    # Embed in small batches: one huge request crashes Ollama's runner
+                    batch_size = max(1, int(config.get("embed_batch_size", 32)))
+                    for i in range(0, len(chunks), batch_size):
+                        db.add_documents(chunks[i:i + batch_size], ids=ids[i:i + batch_size])
+                except Exception as e:
+                    # Leave the file out of the manifest so the next sync retries it,
+                    # and drop any partially written chunks so a retry can't duplicate them.
+                    print(f"Error indexing '{fname}': {type(e).__name__}: {e}")
+                    try:
+                        db.delete(where={"source": fname})
+                    except Exception:
+                        pass
+                    manifest["files"].pop(fname, None)
+                    failed[fname] = f"{type(e).__name__}: {e}"
+                    continue
+
+                manifest["files"][fname] = {
+                    "mtime": info["mtime"],
+                    "size": info["size"],
+                    "chunks_count": len(chunks)
+                }
 
         # Update total chunk count
         manifest["total_chunks"] = sum(f["chunks_count"] for f in manifest["files"].values())
+        manifest["failed"] = failed
         save_manifest(manifest)
 
     if verbose:
@@ -274,11 +361,17 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
     return manifest
 
 
+# Seconds of no file activity before a sync runs. Long enough for a large copy's
+# trailing write events to land, so files aren't indexed half-written.
+WATCHER_QUIET_SECONDS = 2.0
+
+
 # Watchdog Handler
 class SourceFolderHandler(FileSystemEventHandler):
     def __init__(self, callback):
         self.callback = callback
-        self.last_triggered = 0.0
+        self._timer = None
+        self._timer_lock = threading.Lock()
 
     def on_any_event(self, event):
         # Filter directories and only trigger on documents folder changes
@@ -288,13 +381,15 @@ class SourceFolderHandler(FileSystemEventHandler):
         filename = os.path.basename(event.src_path)
         ext = os.path.splitext(filename)[1].lower()
         if ext in (".txt", ".md", ".pdf", ".docx", ".xlsx", ".csv", ".html", ".tmp", ".crdownload"):
-            # Avoid rapid multiple triggers by checking elapsed time (debounce)
-            now = time.time()
-            if now - self.last_triggered > 2.0:
-                self.last_triggered = now
-                # Wait briefly for file write completion
-                time.sleep(1.0)
-                self.callback()
+            # Trailing-edge debounce: every event restarts the countdown, so one
+            # sync runs after activity settles rather than on the first event of
+            # a burst (which would miss the rest of the burst).
+            with self._timer_lock:
+                if self._timer is not None:
+                    self._timer.cancel()
+                self._timer = threading.Timer(WATCHER_QUIET_SECONDS, self.callback)
+                self._timer.daemon = True
+                self._timer.start()
 
 
 def start_folder_watcher(callback_func) -> Observer:
