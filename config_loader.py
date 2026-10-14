@@ -14,6 +14,8 @@ _HARDCODED_FALLBACK = {
     "embedding_model": "nomic-embed-text",
     "embed_batch_size": 32,
     "filename_scoping": True,
+    "filename_scoping_ignore": ["10", "k", "q", "8"],
+    "rewrite_followups": True,
     "default_llm_model": "qwen2.5:7b",
     "available_llm_models": [
         "qwen2.5:7b",
