@@ -11,12 +11,26 @@ if [ ! -d ".venv" ]; then
     exit 1
 fi
 
-# Check if Ollama is running
-if ! pgrep -x "ollama" > /dev/null; then
-    echo "⚠️  Ollama does not appear to be running. Attempting to start service..."
-    brew services start ollama
-    # Give it a second to spin up
-    sleep 2
+# Make sure the Ollama server is answering, starting it if needed
+ollama_up() { curl -sf -m 2 http://localhost:11434/api/version > /dev/null; }
+if ! ollama_up; then
+    echo "⚠️  Ollama is not responding. Attempting to start it..."
+    if brew list ollama &> /dev/null; then
+        brew services start ollama
+    elif [ -d "/Applications/Ollama.app" ]; then
+        open -a Ollama
+    else
+        echo "❌ Ollama not found. Install it with 'brew install ollama' or from https://ollama.com."
+        exit 1
+    fi
+    for _ in $(seq 30); do
+        ollama_up && break
+        sleep 1
+    done
+    if ! ollama_up; then
+        echo "❌ Ollama did not start within 30 seconds."
+        exit 1
+    fi
 fi
 
 # Activate the virtual environment and launch Streamlit

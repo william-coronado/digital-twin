@@ -9,7 +9,7 @@ import html
 import streamlit as st
 import ollama
 from ingest import sync_vector_store, SOURCE_DIR, VECTOR_DB_DIR, load_manifest, start_folder_watcher
-from query_engine import QueryEngine
+from query_engine import QueryEngine, finalize_answer
 from config_loader import load_config
 
 config = load_config()
@@ -152,7 +152,7 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 # Watcher Initialization
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner="Indexing documents (the first run on a large folder can take several minutes)...")
 def _init_watcher():
     """Runs once per server process (not per session) — st.cache_resource
     prevents one leaked Observer thread per browser tab/session, which is
@@ -175,27 +175,13 @@ config = load_config()
 target_models = config["available_llm_models"]
 default_llm = config["default_llm_model"]
 
-# Format models to show installed status
-model_options = []
-for model in target_models:
-    is_installed = is_model_installed(model, available_models)
-    status_label = "✅ Installed" if is_installed else "📥 Needs Pulling"
-    model_options.append(f"{model} ({status_label})")
+installed = {m: is_model_installed(m, available_models) for m in target_models}
 
-# Determine default model index
-default_idx = 0
-found_default = False
-for idx, m in enumerate(target_models):
-    if m == default_llm and "Installed" in model_options[idx]:
-        default_idx = idx
-        found_default = True
-        break
-if not found_default:
-    # Fallback to first installed model if default_llm is not pulled yet
-    for idx, opt in enumerate(model_options):
-        if "Installed" in opt:
-            default_idx = idx
-            break
+# Default to default_llm if pulled, else the first pulled model
+if installed.get(default_llm):
+    default_idx = target_models.index(default_llm)
+else:
+    default_idx = next((i for i, m in enumerate(target_models) if installed[m]), 0)
 
 # Initialize Query Engine
 if "query_engine" not in st.session_state:
@@ -228,8 +214,15 @@ with st.sidebar:
     with col2:
         st.metric("Chunks", manifest.get("total_chunks", 0))
         
-    if st.button("🔄 Sync Documents Now", use_container_width=True):
-        with st.spinner("Syncing files in `./source_documents`..."):
+    failed_files = manifest.get("failed", {})
+    if failed_files:
+        with st.expander(f"⚠️ {len(failed_files)} file(s) failed to index"):
+            for file, error in failed_files.items():
+                st.markdown(f"**{file}**: {error}")
+            st.caption("They're retried on the next sync.")
+
+    if st.button("🔄 Sync Documents Now", width="stretch"):
+        with st.spinner(f"Syncing files in `{SOURCE_DIR}`..."):
             manifest = sync_vector_store()
             st.success("Synchronized successfully!")
             time.sleep(0.5)
@@ -237,15 +230,15 @@ with st.sidebar:
 
     # 3. Model Configuration
     st.markdown("#### 🤖 Model Configuration")
-    selected_model_str = st.selectbox(
+    # Plain model names as options (status only in the label), so the
+    # selection survives a model being pulled while the app runs
+    selected_model = st.selectbox(
         "Select Local LLM:",
-        model_options,
-        index=default_idx
+        target_models,
+        index=default_idx,
+        format_func=lambda m: f"{m} ({'✅ Installed' if installed[m] else '📥 Needs Pulling'})",
     )
-    
-    # Extract clean model name
-    selected_model = selected_model_str.split(" (")[0]
-    
+
     # Update model in Query Engine if changed
     if selected_model != st.session_state.active_model:
         st.session_state.query_engine.change_model(selected_model)
@@ -253,7 +246,7 @@ with st.sidebar:
         st.toast(f"Switched model to: {selected_model}")
         
     # Help message if the model needs pulling
-    if "Needs Pulling" in selected_model_str:
+    if not installed[selected_model]:
         st.warning(f"Model `{selected_model}` is not pulled. Run `ollama pull {selected_model}` in your terminal to download it locally.")
 
     # 4. Source Documents List
@@ -264,7 +257,7 @@ with st.sidebar:
             file_chunks = manifest["files"][file].get("chunks_count", 0)
             st.markdown(f"📄 **{file}** *({file_chunks} chunks)*")
     else:
-        st.info("No documents indexed. Drop `.txt`, `.md`, `.pdf`, `.docx`, `.xlsx`, `.csv`, or `.html` into `./source_documents` folder to start.")
+        st.info(f"No documents indexed. Drop `.txt`, `.md`, `.pdf`, `.docx`, `.xlsx`, `.csv`, or `.html` into `{SOURCE_DIR}` to start.")
 
 
 # --- MAIN CHAT PANEL ---
@@ -278,54 +271,42 @@ if not st.session_state.messages:
     This interface connects directly to your local file repository and serves a Retrieval-Augmented Generation (RAG) loop using models running 100% on your device.
     
     **How to use:**
-    1. Place files inside the `./source_documents` directory in this project workspace.
+    1. Place files inside `{os.path.abspath(SOURCE_DIR)}`.
     2. Click **Sync Documents Now** in the sidebar (or let the automatic background watcher sync it).
     3. Ask questions in the chat bar below. The system will retrieve matching facts and reply.
     
     *Privacy Guarantee: No internet request is made. All file parsing, vector embeddings, and LLM completions are kept local.*
     """)
     
-    # Initialize active suggested prompts in session state
+    def draw_suggestions():
+        prompts = config["suggested_prompts"]
+        st.session_state.active_suggestions = random.sample(prompts, min(2, len(prompts)))
+
     if "active_suggestions" not in st.session_state:
-        all_prompts = config.get("suggested_prompts", [
-            "What projects are discussed in the indexed documents?",
-            "Summarize the main themes found in the document store."
-        ])
-        st.session_state.active_suggestions = random.sample(all_prompts, min(2, len(all_prompts)))
+        draw_suggestions()
 
     # Suggested queries cards
     st.markdown("#### Try these sample queries:")
-    col1, col2 = st.columns(2)
-    
-    # Render suggestion cards dynamically
-    if len(st.session_state.active_suggestions) > 0:
-        with col1:
-            p1 = st.session_state.active_suggestions[0]
-            if st.button(p1, key="sug_1", use_container_width=True):
-                st.session_state.messages.append({"role": "user", "content": p1})
-                st.rerun()
-                
-    if len(st.session_state.active_suggestions) > 1:
-        with col2:
-            p2 = st.session_state.active_suggestions[1]
-            if st.button(p2, key="sug_2", use_container_width=True):
-                st.session_state.messages.append({"role": "user", "content": p2})
+    for col, (i, suggestion) in zip(st.columns(2), enumerate(st.session_state.active_suggestions)):
+        with col:
+            if st.button(suggestion, key=f"sug_{i}", width="stretch"):
+                st.session_state.messages.append({"role": "user", "content": suggestion})
                 st.rerun()
 
-    # Shuffle button
     if st.button("🔄 Shuffle Suggestions", key="shuffle_sug", help="Draw different questions from your config file"):
-        all_prompts = config.get("suggested_prompts", [
-            "What projects are discussed in the indexed documents?",
-            "Summarize the main themes found in the document store."
-        ])
-        st.session_state.active_suggestions = random.sample(all_prompts, min(2, len(all_prompts)))
+        draw_suggestions()
         st.rerun()
 
 # Display chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        
+        if msg.get("rewritten"):
+            st.caption(f"Searched for: {msg['rewritten']}")
+        if msg.get("error"):
+            st.error(msg["content"])
+        else:
+            st.markdown(msg["content"])
+
         # Display source citations if available
         if msg["role"] == "assistant" and msg.get("citations"):
             with st.expander("📚 View Local Source Citations"):
@@ -343,37 +324,32 @@ for msg in st.session_state.messages:
 
 # Check if the last message in history is a user query that needs a response
 if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+    engine = st.session_state.query_engine
+    user_query = st.session_state.messages[-1]["content"]
+    history = [(m["role"], m["content"]) for m in st.session_state.messages[:-1] if not m.get("error")]
+    reply = {"role": "assistant", "citations": []}
     with st.chat_message("assistant"):
-        response_placeholder = st.empty()
-        with st.spinner("Retrieving local facts and generating response..."):
-            user_query = st.session_state.messages[-1]["content"]
-            response_text, citations = st.session_state.query_engine.query(user_query)
-            
-        response_placeholder.markdown(response_text)
-        
-        # Display citations
-        if citations:
-            with st.expander("📚 View Local Source Citations"):
-                for idx, citation in enumerate(citations):
-                    page_lbl = f", Page {citation['page']}" if citation.get("page") else ""
-                    safe_source = html.escape(str(citation["source"]))
-                    safe_content = html.escape(citation["content"])
-                    st.markdown(
-                        f"""<div class="citation-card">
-                            <div class="citation-header">[{idx + 1}] Source: {safe_source}{page_lbl}</div>
-                            <div>{safe_content}</div>
-                        </div>""",
-                        unsafe_allow_html=True
-                    )
-                    
-        # Append assistant message to session state history
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": response_text,
-            "citations": citations
-        })
-        # Rerun to clean up session state and ensure messages display correctly
-        st.rerun()
+        try:
+            with st.spinner("Retrieving local facts..."):
+                question = engine.standalone_question(user_query, history)
+                if question != user_query:
+                    reply["rewritten"] = question
+                chunks, citations = engine.query_stream(question)
+        except Exception as e:
+            reply.update(content=f"Error querying local vector store or rewriting the question: {e}", error=True)
+        else:
+            try:
+                # Stream for responsiveness; the stored (finalized) reply is what
+                # shows after the rerun below
+                streamed = st.write_stream(chunks)
+                raw_answer = streamed if isinstance(streamed, str) else "".join(map(str, streamed))
+                reply["content"], reply["citations"] = finalize_answer(raw_answer, citations)
+            except Exception as e:
+                reply.update(content=f"Error communicating with local LLM server: {e}", error=True)
+
+    st.session_state.messages.append(reply)
+    # Rerun to render the reply from history (with citations) and settle state
+    st.rerun()
 
 # Chat Input
 if prompt := st.chat_input("Ask your local document twin..."):

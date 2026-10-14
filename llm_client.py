@@ -1,5 +1,4 @@
-import os
-from typing import List
+from typing import Iterator, List, Tuple
 from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage
 from config_loader import load_config
@@ -20,6 +19,13 @@ Do not include any explanation, warning, or additional text. Only output that ex
 3. Keep your answers direct, concise, and factual.
 4. Do not refer to the context or retrieved documents directly in your response (e.g., do not write "According to the context..."). Just state the facts.
 """
+
+CONDENSE_PROMPT = """Rewrite the user's latest question so it can be understood without the conversation, resolving references like "it", "they", "that year" or "what about ..." from the earlier turns. Keep names, companies, years and figures exactly as written. If the latest question already stands on its own, return it unchanged. Do not answer it. Output only the question."""
+
+# How much of each earlier answer the rewrite sees: enough to resolve references,
+# small enough to keep the extra LLM call quick.
+HISTORY_ANSWER_CHARS = 500
+
 
 class LocalLLMClient:
     def __init__(self, model_name: str = None, temperature: float = None):
@@ -43,8 +49,10 @@ class LocalLLMClient:
             self.model_name = new_model_name
             self.initialize_client()
 
-    def query(self, prompt: str, context_text: str) -> str:
-        """Sends the system instructions, context, and user prompt to the local LLM."""
+    def stream(self, prompt: str, context_text: str) -> Iterator[str]:
+        """Streams the answer to prompt, grounded in context_text, as the model
+        generates it. Raises if the Ollama server or model can't be reached, so
+        callers can tell an error apart from an answer."""
         if not self.llm:
             self.initialize_client()
 
@@ -59,8 +67,29 @@ class LocalLLMClient:
             HumanMessage(content=formatted_user_prompt)
         ]
 
-        try:
-            response = self.llm.invoke(messages)
-            return response.content.strip()
-        except Exception as e:
-            return f"Error communicating with local LLM server: {e}"
+        for chunk in self.llm.stream(messages):
+            if chunk.content:
+                yield chunk.content
+
+    def rewrite_followup(self, question: str, history: List[Tuple[str, str]]) -> str:
+        """Turns a follow-up like "what about 2022?" into a standalone question
+        using the earlier (role, content) turns, so retrieval and the answer
+        prompt (which never see the chat) know what it refers to. Falls back to
+        the original question if the model's output doesn't look like one."""
+        if not self.llm:
+            self.initialize_client()
+        turns = "\n".join(
+            f"{'User' if role == 'user' else 'Assistant'}: {content[:HISTORY_ANSWER_CHARS]}"
+            for role, content in history
+        )
+        messages = [
+            SystemMessage(content=CONDENSE_PROMPT),
+            HumanMessage(content=f"Conversation:\n{turns}\n\nLatest question: {question}"),
+        ]
+        rewritten = self.llm.invoke(messages).content.strip().strip('"').strip()
+        if rewritten.lower().startswith("latest question:"):
+            rewritten = rewritten.split(":", 1)[1].strip()
+        # An empty or rambling reply means the model answered instead of rewriting
+        if not rewritten or len(rewritten) > max(300, 4 * len(question)):
+            return question
+        return rewritten

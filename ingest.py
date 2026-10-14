@@ -64,7 +64,8 @@ def get_embedding_model() -> PrefixedOllamaEmbeddings:
 
 _db_instance = None
 _db_embedding_settings = None  # what the shared client embeds with (fixed until restart)
-_db_lock = threading.RLock()  # guards instantiation and all read/write calls
+_db_lock = threading.RLock()  # guards instantiation and each read/write call
+_sync_lock = threading.Lock()  # one sync at a time (watcher vs. Sync button)
 
 
 def get_db() -> Chroma:
@@ -209,12 +210,12 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
     Scans the source directory and performs incremental updates to the Chroma DB.
     Detects deleted, new, and modified files.
     """
-    # Hold the lock for the whole sync so a concurrent query (running the
-    # shared Chroma client on another thread) can't interleave with an
-    # in-progress write. Sync runs quickly, so this is fine for a
-    # single-user local tool. The manifest is read inside the lock too, so two
-    # overlapping syncs (watcher + Sync button) can't overwrite each other.
-    with _db_lock:
+    # _sync_lock serializes whole syncs, so two overlapping ones (watcher + Sync
+    # button) can't overwrite each other's manifest. _db_lock is taken only
+    # around each Chroma call, not while parsing PDFs, so queries keep working
+    # during a long sync (waiting at most one embedding batch); they may see a
+    # file's chunks half-replaced until its re-index finishes.
+    with _sync_lock:
         manifest = load_manifest()
         db = get_db()
         config = load_config()
@@ -234,7 +235,8 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
         if previous_settings != index_settings:
             if manifest["files"]:
                 print(f"Index settings changed ({previous_settings} -> {index_settings}); rebuilding the vector store...")
-            db.reset_collection()
+            with _db_lock:
+                db.reset_collection()
             manifest["files"] = {}
         manifest["index_settings"] = index_settings
 
@@ -266,7 +268,8 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
                 print(f"Detected deletion of: {fname}. Removing from vector database...")
             try:
                 # Chroma deletes items using metadata filter
-                db.delete(where={"source": fname})
+                with _db_lock:
+                    db.delete(where={"source": fname})
             except Exception as e:
                 # If the database or collection is empty, delete can fail; we catch and proceed
                 if verbose:
@@ -297,7 +300,8 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
                 # Remove any existing chunks first, even for "new" files: the
                 # manifest may have been lost while the vector store survived.
                 try:
-                    db.delete(where={"source": fname})
+                    with _db_lock:
+                        db.delete(where={"source": fname})
                 except Exception as e:
                     if verbose:
                         print(f"Note: Could not delete old chunks for {fname} from DB: {e}")
@@ -315,13 +319,15 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
                     # Embed in small batches: one huge request crashes Ollama's runner
                     batch_size = max(1, int(config.get("embed_batch_size", 32)))
                     for i in range(0, len(chunks), batch_size):
-                        db.add_documents(chunks[i:i + batch_size], ids=ids[i:i + batch_size])
+                        with _db_lock:
+                            db.add_documents(chunks[i:i + batch_size], ids=ids[i:i + batch_size])
                 except Exception as e:
                     # Leave the file out of the manifest so the next sync retries it,
                     # and drop any partially written chunks so a retry can't duplicate them.
                     print(f"Error indexing '{fname}': {type(e).__name__}: {e}")
                     try:
-                        db.delete(where={"source": fname})
+                        with _db_lock:
+                            db.delete(where={"source": fname})
                     except Exception:
                         pass
                     manifest["files"].pop(fname, None)
