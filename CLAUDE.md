@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Digital Twin is a 100% local, privacy-first RAG (Retrieval-Augmented Generation) system: a Streamlit dashboard backed by ChromaDB for vector storage and Ollama for local embeddings/LLM inference. No network calls are made — all parsing, embedding, and completion happen on-device. There is no test suite or linter config in this project. The app targets **macOS only** by design — `run_dashboard.sh` health-checks Ollama on `localhost:11434` and starts it via `brew services` or `Ollama.app`, with no Linux/Windows equivalent.
+Digital Twin is a 100% local, privacy-first RAG (Retrieval-Augmented Generation) system: a Streamlit dashboard backed by ChromaDB for vector storage and Ollama for local embeddings/LLM inference. No network calls are made — all parsing, embedding, and completion happen on-device. There is a pytest suite (`tests/`) but no linter config. The app targets **macOS only** by design — `run_dashboard.sh` health-checks Ollama on `localhost:11434` and starts it via `brew services` or `Ollama.app`, with no Linux/Windows equivalent.
 
 `.streamlit/config.toml` binds the server to `127.0.0.1` and disables Streamlit's usage statistics — Streamlit's defaults (all interfaces, stats on) would break the local-only/privacy guarantee.
 
@@ -23,7 +23,12 @@ ollama pull qwen2.5:7b
 # -> http://localhost:8501
 ```
 
-There is no build step, lint command, or automated test suite in this repo. Manual verification is done by running the dashboard and exercising the chat UI. `requirements.txt` pins upper bounds (below the next major version) to guard against breaking changes from the fast-moving langchain/chromadb ecosystem — bump deliberately, not by dropping the bounds.
+There is no build step or lint command. Tests run offline in about 2 seconds, with no Ollama needed:
+```bash
+pip install -r requirements-dev.txt   # once: adds pytest
+python -m pytest
+```
+`tests/conftest.py` keeps tests away from real data: config comes from `config.default.json` only (never `config.json`), the autouse `no_real_store` fixture points `ingest`'s module globals at throwaway paths, and the `store` fixture gives sync/query tests their own temporary source folder and Chroma store with `HashingEmbeddings` (deterministic, unit-length bag-of-words vectors) in place of Ollama. LLM calls are stubbed. Don't call `monkeypatch.undo()` inside a test: it also reverts those fixtures and points `ingest` back at the configured store. UI changes still need a manual check by running the dashboard (or a headless `streamlit.testing.v1.AppTest`). `requirements.txt` pins upper bounds (below the next major version) to guard against breaking changes from the fast-moving langchain/chromadb ecosystem — bump deliberately, not by dropping the bounds.
 
 To manually trigger a one-off ingestion sync from the command line (without starting the dashboard):
 ```bash
