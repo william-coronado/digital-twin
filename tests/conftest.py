@@ -7,6 +7,7 @@ import math
 import os
 import re
 import shutil
+import tempfile
 from types import SimpleNamespace
 from typing import List
 
@@ -14,9 +15,19 @@ import pytest
 from langchain_core.embeddings import Embeddings
 
 import config_loader
-import ingest
-import llm_client
-import query_engine
+
+# The app modules read config at import time (ingest also creates the configured
+# folders), so before importing them, swap the user's config.json for a test one
+# whose folders live in a temporary directory.
+_TEST_DIR = tempfile.mkdtemp(prefix="digital-twin-tests-")
+config_loader.CONFIG_PATH = os.path.join(_TEST_DIR, "config.json")
+with open(config_loader.CONFIG_PATH, "w") as f:
+    json.dump({"source_documents_dir": os.path.join(_TEST_DIR, "src"),
+               "vector_db_dir": os.path.join(_TEST_DIR, "vs")}, f)
+
+import ingest  # noqa: E402
+import llm_client  # noqa: E402
+import query_engine  # noqa: E402
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAMPLE_DIR = os.path.join(PROJECT_DIR, "source_documents")

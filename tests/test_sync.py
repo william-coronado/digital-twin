@@ -1,8 +1,8 @@
 """Incremental indexing: manifest handling, rebuilds, failure recovery and the watcher."""
 import json
 import os
-import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import ingest
 from conftest import chunk_count, sources_in_db
@@ -152,11 +152,10 @@ def test_failed_delete_keeps_old_entry_for_retry(store):
 def test_overlapping_syncs_agree(store):
     sync()
     (store.src / "new.md").write_text("Widgets are blue.\n")
-    threads = [threading.Thread(target=sync) for _ in range(2)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(sync) for _ in range(2)]
+    for future in futures:
+        future.result()  # re-raises if either sync failed
     assert manifest_on_disk()["total_chunks"] == chunk_count()
     assert "new.md" in manifest_on_disk()["files"]
 
