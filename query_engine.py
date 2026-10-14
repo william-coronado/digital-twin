@@ -74,7 +74,12 @@ class QueryEngine:
         rather than a whole file."""
         config = load_config()
         k_val = top_k if top_k is not None else config["top_k"]
-        scoped = scope_sources(user_query, list(load_manifest()["files"])) if config.get("filename_scoping", True) else []
+        scoped = []
+        if config.get("filename_scoping", True):
+            # Files with no chunks (e.g. scanned PDFs) can't answer anything
+            searchable = [f for f, info in load_manifest()["files"].items() if info.get("chunks_count")]
+            scoped = scope_sources(user_query, searchable)
+        hits = []
         with _db_lock:
             if scoped:
                 # Search each matching file separately so one file can't crowd out the others
@@ -82,20 +87,20 @@ class QueryEngine:
                 per_file = [self.db.similarity_search_with_score(user_query, k=per_file_k, filter={"source": src})
                             for src in scoped]
                 hits = [hit for rank in zip_longest(*per_file) for hit in rank if hit]
-            else:
+            if not hits:
+                # Unscoped, or the scoped files had nothing (e.g. removed by a sync since the manifest was read)
                 hits = self.db.similarity_search_with_score(user_query, k=k_val)
         # The collection uses Chroma's default squared-L2 distance; for the
         # unit-length vectors Ollama returns, cosine similarity = 1 - d / 2.
-        min_similarity = config.get("min_similarity", 0.0)
+        min_similarity = config.get("min_similarity", 0.0)  # 0 = no cutoff
         scored = [(doc, 1 - dist / 2) for doc, dist in hits]
-        return [(doc, sim) for doc, sim in scored if sim >= min_similarity]
+        return [(doc, sim) for doc, sim in scored if not min_similarity or sim >= min_similarity]
 
     def query(self, user_query: str, top_k: int = None) -> Tuple[str, List[Dict[str, Any]]]:
         """
         Executes semantic search, injects context to system prompt,
         calls the local LLM, and returns the response with source citations.
         """
-        config = load_config()
         # 1. Retrieve most similar document chunks
         try:
             hits = self.retrieve(user_query, top_k)
@@ -106,8 +111,9 @@ class QueryEngine:
             return "Information not found locally.", []
 
         # 2. Assemble context content and build source citations list, within
-        # the model's context window
-        budget_chars = (config.get("num_ctx", 8192) - RESERVED_TOKENS) * CHARS_PER_TOKEN
+        # the context window of the running client (config may have changed since)
+        num_ctx = self.llm_client.llm.num_ctx
+        budget_chars = (num_ctx - RESERVED_TOKENS) * CHARS_PER_TOKEN - len(user_query)
         context_parts = []
         citations = []
         seen_chunks = set()
@@ -124,8 +130,14 @@ class QueryEngine:
             
             page_info = f" (Page {page})" if page else ""
             part = f"--- Document: {source}{page_info} ---\n{doc.page_content}"
-            if context_parts and budget_chars - len(part) < 0:
-                break
+            if len(part) > budget_chars:
+                if context_parts:
+                    break
+                # Even the best chunk alone doesn't fit (tiny num_ctx or huge
+                # chunk_size): send what fits rather than overflow the window
+                part = part[:max(budget_chars, 0)]
+                if not part:
+                    break
             budget_chars -= len(part) + 2  # + the "\n\n" separator
             context_parts.append(part)
             
