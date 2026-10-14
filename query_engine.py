@@ -1,5 +1,6 @@
 import math
 import re
+from itertools import zip_longest
 from typing import List, Dict, Any, Tuple
 from langchain_core.documents import Document
 from ingest import get_db, load_manifest, _db_lock
@@ -14,6 +15,11 @@ MAX_SCOPED_SOURCES = 4
 # Once the search is confined to a few files, look deeper: the answer is often a numeric table
 # chunk that ranks just below prose about the same topic.
 SCOPED_TOTAL_K = 8
+# Prompt-size budget: num_ctx minus room for the system prompt, question and
+# answer, at a conservative chars-per-token (numeric tables tokenize densely).
+# Ollama silently drops the start of an over-long prompt, system prompt included.
+RESERVED_TOKENS = 1536
+CHARS_PER_TOKEN = 3
 
 
 def _tokens(text: str) -> set:
@@ -61,36 +67,52 @@ class QueryEngine:
         """Allows switching models dynamically from the UI."""
         self.llm_client.change_model(model_name)
 
+    def retrieve(self, user_query: str, top_k: int = None) -> List[Tuple[Document, float]]:
+        """Returns (chunk, cosine similarity) pairs, best first, dropping any
+        below config "min_similarity". Scoped searches are interleaved by rank
+        across files, so trimming the tail drops each file's weakest chunks
+        rather than a whole file."""
+        config = load_config()
+        k_val = top_k if top_k is not None else config["top_k"]
+        scoped = scope_sources(user_query, list(load_manifest()["files"])) if config.get("filename_scoping", True) else []
+        with _db_lock:
+            if scoped:
+                # Search each matching file separately so one file can't crowd out the others
+                per_file_k = max(k_val, SCOPED_TOTAL_K // len(scoped))
+                per_file = [self.db.similarity_search_with_score(user_query, k=per_file_k, filter={"source": src})
+                            for src in scoped]
+                hits = [hit for rank in zip_longest(*per_file) for hit in rank if hit]
+            else:
+                hits = self.db.similarity_search_with_score(user_query, k=k_val)
+        # The collection uses Chroma's default squared-L2 distance; for the
+        # unit-length vectors Ollama returns, cosine similarity = 1 - d / 2.
+        min_similarity = config.get("min_similarity", 0.0)
+        scored = [(doc, 1 - dist / 2) for doc, dist in hits]
+        return [(doc, sim) for doc, sim in scored if sim >= min_similarity]
+
     def query(self, user_query: str, top_k: int = None) -> Tuple[str, List[Dict[str, Any]]]:
         """
         Executes semantic search, injects context to system prompt,
         calls the local LLM, and returns the response with source citations.
         """
         config = load_config()
-        k_val = top_k if top_k is not None else config["top_k"]
         # 1. Retrieve most similar document chunks
         try:
-            scoped = scope_sources(user_query, list(load_manifest()["files"])) if config.get("filename_scoping", True) else []
-            with _db_lock:
-                if scoped:
-                    # Search each matching file separately so one file can't crowd out the others
-                    per_file_k = max(k_val, SCOPED_TOTAL_K // len(scoped))
-                    docs = [d for src in scoped
-                            for d in self.db.similarity_search(user_query, k=per_file_k, filter={"source": src})]
-                else:
-                    docs = self.db.similarity_search(user_query, k=k_val)
+            hits = self.retrieve(user_query, top_k)
         except Exception as e:
             return f"Error querying local vector store: {e}", []
 
-        if not docs:
+        if not hits:
             return "Information not found locally.", []
 
-        # 2. Assemble context content and build source citations list
+        # 2. Assemble context content and build source citations list, within
+        # the model's context window
+        budget_chars = (config.get("num_ctx", 8192) - RESERVED_TOKENS) * CHARS_PER_TOKEN
         context_parts = []
         citations = []
         seen_chunks = set()
 
-        for doc in docs:
+        for doc, _ in hits:
             source = doc.metadata.get("source", "Unknown Document")
             page = doc.metadata.get("page")
             
@@ -101,7 +123,11 @@ class QueryEngine:
             seen_chunks.add(chunk_sig)
             
             page_info = f" (Page {page})" if page else ""
-            context_parts.append(f"--- Document: {source}{page_info} ---\n{doc.page_content}")
+            part = f"--- Document: {source}{page_info} ---\n{doc.page_content}"
+            if context_parts and budget_chars - len(part) < 0:
+                break
+            budget_chars -= len(part) + 2  # + the "\n\n" separator
+            context_parts.append(part)
             
             citations.append({
                 "source": source,

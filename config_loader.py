@@ -30,7 +30,9 @@ _HARDCODED_FALLBACK = {
     "chunk_size": 1000,
     "chunk_overlap": 200,
     "temperature": 0.0,
-    "top_k": 4
+    "top_k": 4,
+    "num_ctx": 8192,
+    "min_similarity": 0.0
 }
 
 

@@ -26,14 +26,44 @@ os.makedirs(SOURCE_DIR, exist_ok=True)
 os.makedirs(VECTOR_DB_DIR, exist_ok=True)
 
 
-def get_embedding_model() -> OllamaEmbeddings:
+# Task prefixes some embedding models were trained with; retrieval quality drops
+# without them. Keyed by model name without tag: (query prefix, document prefix).
+# Override per model with "embedding_query_prefix"/"embedding_document_prefix".
+KNOWN_EMBEDDING_PREFIXES = {
+    "nomic-embed-text": ("search_query: ", "search_document: "),
+    "mxbai-embed-large": ("Represent this sentence for searching relevant passages: ", ""),
+}
+
+
+class PrefixedOllamaEmbeddings(OllamaEmbeddings):
+    """OllamaEmbeddings that prepends the model's task prefix. Only the embedded
+    text is prefixed; Chroma stores the original chunk text."""
+    query_prefix: str = ""
+    document_prefix: str = ""
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return super().embed_documents([self.document_prefix + t for t in texts])
+
+    def embed_query(self, text: str) -> List[float]:
+        # The base embed_query routes through embed_documents, which would add
+        # the document prefix as well, so call the parent's directly.
+        return super().embed_documents([self.query_prefix + text])[0]
+
+
+def get_embedding_model() -> PrefixedOllamaEmbeddings:
     """Returns local embedding model wrapper."""
     config = load_config()
-    return OllamaEmbeddings(model=config["embedding_model"])
+    model = config["embedding_model"]
+    query_prefix, document_prefix = KNOWN_EMBEDDING_PREFIXES.get(model.split(":")[0], ("", ""))
+    return PrefixedOllamaEmbeddings(
+        model=model,
+        query_prefix=config.get("embedding_query_prefix", query_prefix),
+        document_prefix=config.get("embedding_document_prefix", document_prefix),
+    )
 
 
 _db_instance = None
-_db_embedding_model = None  # model the shared client was built with (fixed until restart)
+_db_embedding_settings = None  # what the shared client embeds with (fixed until restart)
 _db_lock = threading.RLock()  # guards instantiation and all read/write calls
 
 
@@ -42,7 +72,7 @@ def get_db() -> Chroma:
     (rather than one per ingest call and a separate one in QueryEngine)
     avoids two client objects concurrently hitting the same on-disk
     SQLite files from different threads (the folder watcher vs. queries)."""
-    global _db_instance, _db_embedding_model
+    global _db_instance, _db_embedding_settings
     with _db_lock:
         if _db_instance is None:
             embeddings = get_embedding_model()
@@ -51,7 +81,10 @@ def get_db() -> Chroma:
                 embedding_function=embeddings,
                 persist_directory=VECTOR_DB_DIR,
             )
-            _db_embedding_model = embeddings.model
+            _db_embedding_settings = {
+                "embedding_model": embeddings.model,
+                "document_prefix": embeddings.document_prefix,
+            }
         return _db_instance
 
 
@@ -186,20 +219,23 @@ def sync_vector_store(verbose: bool = True) -> Dict[str, Any]:
         db = get_db()
         config = load_config()
 
-        # 1. Rebuild from scratch if the embedding model or chunking changed: old
-        # vectors would be incompatible (or chunked differently) from new ones.
-        # Changing embedding_model takes effect after a restart (see get_db()).
+        # 1. Rebuild from scratch if the embedding model, document prefix or
+        # chunking changed: old vectors would be incompatible (or chunked
+        # differently) from new ones. Embedding changes take effect after a
+        # restart (see get_db()).
         index_settings = {
-            "embedding_model": _db_embedding_model,
+            **_db_embedding_settings,
             "chunk_size": config["chunk_size"],
             "chunk_overlap": config["chunk_overlap"],
         }
-        previous_settings = manifest.get("index_settings")
-        if previous_settings is not None and previous_settings != index_settings:
-            print(f"Index settings changed ({previous_settings} -> {index_settings}); rebuilding the vector store...")
+        # Older manifests lack some or all of these keys: assume they matched,
+        # except the document prefix, which didn't exist before (so was "").
+        previous_settings = {**index_settings, "document_prefix": "", **manifest.get("index_settings", {})}
+        if previous_settings != index_settings:
+            if manifest["files"]:
+                print(f"Index settings changed ({previous_settings} -> {index_settings}); rebuilding the vector store...")
             db.reset_collection()
             manifest["files"] = {}
-        # Manifests written before this check existed are assumed to match.
         manifest["index_settings"] = index_settings
 
         # 2. Get list of files in source directory recursively

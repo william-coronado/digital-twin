@@ -30,11 +30,11 @@ class LocalLLMClient:
 
     def initialize_client(self):
         """Initializes the Ollama client with current settings."""
-        # Set context size to 8192 to allow large context RAG retrieval
+        # Context window in tokens; QueryEngine sizes the retrieved context to fit it
         self.llm = ChatOllama(
             model=self.model_name,
             temperature=self.temperature,
-            num_ctx=8192,
+            num_ctx=load_config().get("num_ctx", 8192),
         )
 
     def change_model(self, new_model_name: str):
