@@ -237,12 +237,14 @@ with st.sidebar:
 
     # 3. Model Configuration
     st.markdown("#### 🤖 Model Configuration")
-    # Plain model names as options (status only in the label), so the
-    # selection survives a model being pulled while the app runs
+    # The key keeps the selection when a model is pulled while the app runs:
+    # labels and default_idx change then, which resets an unkeyed widget
+    # (key-based identity needs Streamlit 1.50+)
     selected_model = st.selectbox(
         "Select Local LLM:",
         target_models,
         index=default_idx,
+        key="llm_model",
         format_func=lambda m: f"{m} ({'✅ Installed' if installed[m] else '📥 Needs Pulling'})",
     )
 

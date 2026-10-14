@@ -11,7 +11,7 @@ pypdf>=4.0.0,<7.0.0
 cryptography>=3.1,<50.0.0  # required by pypdf to read AES-encrypted PDFs
 python-docx>=1.1.0,<2.0.0
 watchdog>=4.0.0,<7.0.0
-streamlit>=1.35.0,<2.0.0
+streamlit>=1.50.0,<2.0.0  # width= on buttons (1.48), key-based widget identity (1.50)
 ollama>=0.2.0,<1.0.0
 pandas>=2.0.0,<4.0.0
 openpyxl>=3.1.0,<4.0.0
