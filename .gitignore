@@ -17,6 +17,7 @@ metadata_manifest.json
 # Personal / machine-specific configs — config.default.json is the tracked template
 config.json
 config.theology.json
+CLAUDE.local.md
 
 # Claude Code local-only files (skills dirs contain symlinks into .venv/, machine-specific)
 .claude/settings.local.json
